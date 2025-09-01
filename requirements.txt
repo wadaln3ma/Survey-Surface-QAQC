@@ -13,3 +13,4 @@ folium
 streamlit-folium
 pillow
 matplotlib
+scikit-image>=0.22

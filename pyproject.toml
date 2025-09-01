@@ -13,10 +13,8 @@ dependencies = [
   "pillow>=10.0",
   "matplotlib>=3.7",
   "affine>=2.4",
+  "scikit-image>=0.22",     # ← add this
 ]
 
 [project.optional-dependencies]
 app = ["streamlit>=1.31", "streamlit-folium>=0.18"]
-
-[tool.setuptools.packages.find]
-include = ["survey_surface*"]
