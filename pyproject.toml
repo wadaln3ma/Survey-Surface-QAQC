@@ -1,20 +1,28 @@
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
-name = "survey-surface-qaqc"
+name = "survey-surface"
 version = "0.1.0"
-description = "Build DEM from survey points, contours, cut/fill volumes, LandXML export, Streamlit viewer."
-readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Abdulrahman Hamad", email = "wadaln3ma@gmail.com" }]
-keywords = ["gis", "surveying", "geomatics", "dem", "contours", "landxml", "civil3d"]
-# Keep runtime deps in requirements.txt for now (easier for users)
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.26",           # wheels available on Linux CI
+  "pandas>=1.5",
+  "geopandas>=0.13",
+  "rasterio>=1.3",
+  "shapely>=2.0",
+  "scipy>=1.10",
+  "folium>=0.14",
+  "pillow>=10.0",
+  "matplotlib>=3.7",
+  "affine>=2.4",
+]
 
-[project.urls]
-Homepage = "https://github.com/wadaln3ma/Survey-Surface-QAQC"
+[project.optional-dependencies]
+app = [
+  "streamlit>=1.31",
+  "streamlit-folium>=0.18",
+]
+
+[tool.setuptools.packages.find]
+include = ["survey_surface*"]
 
 [project.scripts]
-survey-surface = "survey_surface.cli:app"   # Typer app as CLI
+survey-surface = "survey_surface.cli:main"
