@@ -52,12 +52,13 @@ def _save_uploaded_file(uploaded, dest: Path) -> Path:
     return dest
 
 def _reset_outputs():
+    """Clear outputs/ and Streamlit caches, then rerun fresh."""
     if OUT_DIR.exists():
         shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     st.cache_data.clear()
-    # clear any stored scale values
-    for k in ["cr_vmin", "cr_vmax"]:
+    # clear any stored scale/bounds
+    for k in ["cr_vmin", "cr_vmax", "dem_bounds", "map_key"]:
         if k in st.session_state:
             del st.session_state[k]
     st.success("Outputs and cache cleared.")
@@ -112,6 +113,16 @@ def _run_landxml_from_csv(csv_path: str, x: Optional[str], y: Optional[str],
 def _bounds_from_raster(dem_path: str):
     with rasterio.open(dem_path) as src:
         return [[src.bounds.bottom, src.bounds.left], [src.bounds.top, src.bounds.right]]
+
+def _focus_map_on_dem(dem_path: str):
+    """Compute DEM bounds (EPSG:4326) and ask the Map tab to refocus."""
+    try:
+        bounds = _bounds_from_raster(dem_path)  # [[south,west],[north,east]]
+        st.session_state["dem_bounds"] = bounds
+        st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1  # force re-render
+        st.toast("Map zoomed to AOI.", icon="🔍")
+    except Exception as e:
+        st.warning(f"Could not compute map bounds to focus: {e}")
 
 # ---------------------------- HILLSHADE ----------------------------
 def _hillshade(arr: np.ndarray, transform, azimuth: float = 315.0, altitude: float = 45.0, z_factor: float = 1.0) -> np.ndarray:
@@ -258,7 +269,7 @@ def _make_colorramp_legend_png(cmap_name: str, vmin: float, vmax: float,
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 16)
         font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
-    except:
+    except Exception:
         font = ImageFont.load_default()
         font_b = ImageFont.load_default()
 
@@ -269,7 +280,6 @@ def _make_colorramp_legend_png(cmap_name: str, vmin: float, vmax: float,
     draw.text((14, 8), title, fill=(255, 255, 255, 230), font=font_b)
 
     # Labels (vmin, mid, vmax)
-    lbl_pad = 6
     labels = [(0, f"{vmin:.2f}"), (width//2, f"{(vmin+vmax)/2:.2f}"), (width-1, f"{vmax:.2f}")]
     for x_pos, txt in labels:
         tw, th = draw.textsize(txt, font=font)
@@ -386,9 +396,11 @@ def _build_map(
             tiles=cfg["tiles"],
             attr=cfg["attr"],
             name=name,
-            control=False,
+            control=False,  # use sidebar picker instead
             show=(name == basemap_choice),
         ).add_to(m)
+
+    # Optional labels overlay for 'Hybrid' with Satellite
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
         attr="Labels © Esri",
@@ -397,6 +409,8 @@ def _build_map(
         overlay=True,
         show=(hybrid_labels and basemap_choice == "Satellite"),
     ).add_to(m)
+
+    # Overlays
     if colorrelief_png and os.path.exists(colorrelief_png) and colorrelief_bounds:
         folium.raster_layers.ImageOverlay(
             name="Color Relief",
@@ -407,6 +421,7 @@ def _build_map(
             cross_origin=False,
             zindex=300,
         ).add_to(m)
+
     if hillshade_png and os.path.exists(hillshade_png) and hillshade_bounds:
         folium.raster_layers.ImageOverlay(
             name="Hillshade",
@@ -417,6 +432,7 @@ def _build_map(
             cross_origin=False,
             zindex=400,
         ).add_to(m)
+
     if contours_path and os.path.exists(contours_path):
         try:
             with open(contours_path, "r", encoding="utf-8") as f:
@@ -433,8 +449,10 @@ def _build_map(
             ).add_to(m)
         except Exception as e:
             st.warning(f"Could not render contours: {e}")
+
     if bounds:
         m.fit_bounds(bounds, padding=(10, 10))
+
     folium.LayerControl(collapsed=False).add_to(m)
     return m
 
@@ -494,7 +512,7 @@ with st.sidebar:
     hs_az = st.slider("Hillshade azimuth (°)", 0, 360, 315, 1, disabled=not hs_on)
     hs_alt = st.slider("Hillshade altitude (°)", 1, 90, 45, 1, disabled=not hs_on)
     hs_opacity = st.slider("Hillshade opacity", 0.1, 1.0, 0.6, 0.05, disabled=not hs_on)
-    hs_z = st.slider("Hillshade Z factor", 0.2, 5.0, 1.0, 0.1, disabled=not hs_on)
+    hs_z = st.slider("Hillshade Z factor", 0.2, 5.0, 1.0, disabled=not hs_on)
 
     st.markdown("---")
     st.markdown("### Basemap")
@@ -518,6 +536,7 @@ if mode == "Quick Demo (auto-generate)":
     st.write("We’ll generate synthetic points near Riyadh, build a DEM, draw contours, compute volumes, and export LandXML — all in a few seconds.")
     run = st.button("▶️ Run Demo Now", type="primary")
     if run:
+        # Synthetic CSV
         csv_path = DATA_DIR / "sample_points.csv"
         import csv, math, random
         random.seed(42)
@@ -545,6 +564,9 @@ if mode == "Quick Demo (auto-generate)":
                                                  z_col="z", in_crs=in_crs, to_crs=to_crs)
         with st.spinner("Assembling QA/QC report..."):
             report_path = _run_report(dem_path, contours_path)
+
+        # Auto-focus the map to the DEM AOI
+        _focus_map_on_dem(dem_path)
 
 elif mode == "Upload CSV & Run":
     st.subheader("Upload CSV & Run")
@@ -587,6 +609,9 @@ elif mode == "Upload CSV & Run":
             with st.spinner("Assembling QA/QC report..."):
                 report_path = _run_report(dem_path, contours_path)
 
+            # Auto-focus the map to the DEM AOI
+            _focus_map_on_dem(dem_path)
+
 else:
     st.subheader("Browse Existing Outputs")
     dem_path = st.text_input("DEM path", value=str(OUT_DIR / "dem.tif"))
@@ -602,8 +627,9 @@ _ = _auto_demo_if_empty()
 tabs = st.tabs(["🗺️ Map", "📊 Stats & Volumes", "⬇️ Downloads", "ℹ️ How it works"])
 
 with tabs[0]:
-    dem_bounds = None
-    if dem_path and os.path.exists(dem_path):
+    # Prefer bounds saved by pipeline; fallback to reading from file
+    dem_bounds = st.session_state.get("dem_bounds")
+    if (dem_bounds is None) and dem_path and os.path.exists(dem_path):
         try:
             dem_bounds = _bounds_from_raster(dem_path)
         except Exception as e:
@@ -612,45 +638,64 @@ with tabs[0]:
     # Build overlays
     cr_png, cr_bounds = None, None
     cr_vmin, cr_vmax = None, None
-    if cr_on and dem_path and os.path.exists(dem_path):
-        try:
-            cr_png_path = str(OUT_DIR / "color_relief.png")
-            cr_png, cr_bounds, cr_vmin, cr_vmax = _make_colorrelief_png(
-                dem_path,
-                cmap_name=cr_cmap,
-                vmin_mode=cr_min_mode,
-                vmax_mode=cr_max_mode,
-                custom_min=cr_min_val if cr_min_mode == "custom" else None,
-                custom_max=cr_max_val if cr_max_mode == "custom" else None,
-                out_png=cr_png_path,
-            )
-            # store for Downloads tab
-            st.session_state["cr_vmin"] = cr_vmin
-            st.session_state["cr_vmax"] = cr_vmax
-        except Exception as e:
-            st.warning(f"Could not compute color relief: {e}")
+    if "cr_on" in st.session_state:
+        pass  # no-op; quiet linters
+    if (st.session_state.get("cr_on", True) or True) and st.session_state.get("cr_on", True) and dem_path and os.path.exists(dem_path):
+        # respect the control state (cr_on) from the sidebar
+        if st.session_state.get("cr_on", True):
+            try:
+                cr_png_path = str(OUT_DIR / "color_relief.png")
+                cr_png, cr_bounds, cr_vmin, cr_vmax = _make_colorrelief_png(
+                    dem_path,
+                    cmap_name=st.session_state.get("cr_cmap", "viridis") if "cr_cmap" in st.session_state else "viridis",
+                    vmin_mode=st.session_state.get("cr_min_mode", "auto"),
+                    vmax_mode=st.session_state.get("cr_max_mode", "auto"),
+                    custom_min=st.session_state.get("cr_min_val") if st.session_state.get("cr_min_mode") == "custom" else None,
+                    custom_max=st.session_state.get("cr_max_val") if st.session_state.get("cr_max_mode") == "custom" else None,
+                    out_png=cr_png_path,
+                )
+                st.session_state["cr_vmin"] = cr_vmin
+                st.session_state["cr_vmax"] = cr_vmax
+            except Exception as e:
+                st.warning(f"Could not compute color relief: {e}")
 
+    # Hillshade
     hs_png, hs_bounds = None, None
-    if hs_on and dem_path and os.path.exists(dem_path):
+    if st.session_state.get("hs_on", True) and dem_path and os.path.exists(dem_path):
         try:
             hs_png_path = str(OUT_DIR / "hillshade.png")
-            hs_png, hs_bounds = _make_hillshade_png(dem_path, hs_az, hs_alt, hs_z, hs_png_path)
+            hs_png, hs_bounds = _make_hillshade_png(
+                dem_path,
+                st.session_state.get("hs_az", 315),
+                st.session_state.get("hs_alt", 45),
+                st.session_state.get("hs_z", 1.0),
+                hs_png_path,
+            )
         except Exception as e:
             st.warning(f"Could not compute hillshade: {e}")
 
+    # Build map
     m = _build_map(
         contours_path=contours_path,
         bounds=dem_bounds,
-        basemap_choice=basemap_choice,
-        hybrid_labels=hybrid_labels,
+        basemap_choice=st.session_state.get("basemap_choice", "Satellite") if "basemap_choice" in st.session_state else "Satellite",
+        hybrid_labels=st.session_state.get("hybrid_labels", True) if "hybrid_labels" in st.session_state else True,
         colorrelief_png=cr_png,
         colorrelief_bounds=cr_bounds,
-        cr_opacity=cr_opacity,
+        cr_opacity=st.session_state.get("cr_opacity", 0.85) if "cr_opacity" in st.session_state else 0.85,
         hillshade_png=hs_png,
         hillshade_bounds=hs_bounds,
-        hs_opacity=hs_opacity,
+        hs_opacity=st.session_state.get("hs_opacity", 0.6) if "hs_opacity" in st.session_state else 0.6,
     )
-    st_folium(m, height=560, use_container_width=True)
+
+    # Manual zoom button
+    colz1, colz2 = st.columns([1, 6])
+    with colz1:
+        if st.button("🔍 Zoom to AOI", disabled=(st.session_state.get("dem_bounds") is None)):
+            st.session_state["map_key"] = st.session_state.get("map_key", 0) + 1
+            st.rerun()
+
+    st_folium(m, height=560, use_container_width=True, key=f"map-{st.session_state.get('map_key',0)}")
 
 with tabs[1]:
     st.subheader("DEM Statistics")
@@ -702,50 +747,52 @@ with tabs[2]:
     st.markdown("**Map & Legend export (overlays only)**")
     if st.button("🖼️ Compose overlays to PNG + legend"):
         # Ensure overlays exist with current params; reuse earlier if created
-        cr_png_path = str(OUT_DIR / "color_relief.png") if cr_on else None
-        hs_png_path = str(OUT_DIR / "hillshade.png") if hs_on else None
+        cr_png_path = str(OUT_DIR / "color_relief.png") if os.path.exists(OUT_DIR / "color_relief.png") else None
+        hs_png_path = str(OUT_DIR / "hillshade.png") if os.path.exists(OUT_DIR / "hillshade.png") else None
 
         # If missing, try to create from DEM
-        if cr_on and (not cr_png_path or not os.path.exists(cr_png_path)):
+        if (cr_png_path is None) and dem_path and os.path.exists(dem_path):
             try:
                 cr_png_path, cr_bounds_tmp, vmin_used, vmax_used = _make_colorrelief_png(
                     dem_path,
-                    cmap_name=cr_cmap,
-                    vmin_mode=cr_min_mode,
-                    vmax_mode=cr_max_mode,
-                    custom_min=cr_min_val if cr_min_mode == "custom" else None,
-                    custom_max=cr_max_val if cr_max_mode == "custom" else None,
+                    cmap_name=st.session_state.get("cr_cmap", "viridis"),
+                    vmin_mode=st.session_state.get("cr_min_mode", "auto"),
+                    vmax_mode=st.session_state.get("cr_max_mode", "auto"),
+                    custom_min=st.session_state.get("cr_min_val") if st.session_state.get("cr_min_mode") == "custom" else None,
+                    custom_max=st.session_state.get("cr_max_val") if st.session_state.get("cr_max_mode") == "custom" else None,
                     out_png=str(OUT_DIR / "color_relief.png"),
                 )
-                if 'cr_bounds' not in locals() or cr_bounds is None:
-                    cr_bounds = cr_bounds_tmp
+                cr_bounds = cr_bounds_tmp
                 st.session_state["cr_vmin"] = vmin_used
                 st.session_state["cr_vmax"] = vmax_used
             except Exception as e:
                 st.error(f"Failed to compute color relief: {e}")
 
-        if hs_on and (not hs_png_path or not os.path.exists(hs_png_path)):
+        if (hs_png_path is None) and dem_path and os.path.exists(dem_path):
             try:
                 hs_png_path, hs_bounds_tmp = _make_hillshade_png(
-                    dem_path, hs_az, hs_alt, hs_z, str(OUT_DIR / "hillshade.png")
+                    dem_path,
+                    st.session_state.get("hs_az", 315),
+                    st.session_state.get("hs_alt", 45),
+                    st.session_state.get("hs_z", 1.0),
+                    str(OUT_DIR / "hillshade.png"),
                 )
-                if 'hs_bounds' not in locals() or hs_bounds is None:
-                    hs_bounds = hs_bounds_tmp
+                hs_bounds = hs_bounds_tmp
             except Exception as e:
                 st.error(f"Failed to compute hillshade: {e}")
 
         # Choose bounds (prefer color relief bounds; else hillshade)
-        bounds_latlon = cr_bounds or hs_bounds or None
+        bounds_latlon = st.session_state.get("dem_bounds") or cr_bounds or hs_bounds or None
 
         out_png = str(OUT_DIR / "map_overlays_composite.png")
         saved = _export_composite_png(
             out_path=out_png,
-            colorrelief_png=cr_png_path if cr_on else None,
-            hillshade_png=hs_png_path if hs_on else None,
+            colorrelief_png=cr_png_path,
+            hillshade_png=hs_png_path,
             contours_geojson=contours_path if contours_path and os.path.exists(contours_path) else None,
             bounds_latlon=bounds_latlon,
-            cr_opacity=cr_opacity,
-            hs_opacity=hs_opacity,
+            cr_opacity=st.session_state.get("cr_opacity", 0.85),
+            hs_opacity=st.session_state.get("hs_opacity", 0.6),
         )
         if saved:
             st.success("Composite created.")
@@ -753,21 +800,20 @@ with tabs[2]:
         else:
             st.info("Nothing to compose yet. Generate overlays first (run demo or upload CSV).")
 
-        # Legend PNG (separate)
+        # Legend PNG
         legend_path = str(OUT_DIR / "color_relief_legend.png")
-        # Use stored scale; if missing, compute from DEM in its native grid (fine for labels)
         vmin = st.session_state.get("cr_vmin")
         vmax = st.session_state.get("cr_vmax")
         if (vmin is None) or (vmax is None):
             vmin, vmax = _compute_vmin_vmax_from_dem(
                 dem_path,
-                cr_min_mode,
-                cr_max_mode,
-                cr_min_val if cr_min_mode == "custom" else None,
-                cr_max_val if cr_max_mode == "custom" else None,
+                st.session_state.get("cr_min_mode", "auto"),
+                st.session_state.get("cr_max_mode", "auto"),
+                st.session_state.get("cr_min_val") if st.session_state.get("cr_min_mode") == "custom" else None,
+                st.session_state.get("cr_max_val") if st.session_state.get("cr_max_mode") == "custom" else None,
             )
         try:
-            legend_saved = _make_colorramp_legend_png(cr_cmap, vmin, vmax, legend_path)
+            legend_saved = _make_colorramp_legend_png(st.session_state.get("cr_cmap", "viridis"), vmin, vmax, legend_path)
             _download_button("Download Legend (PNG)", legend_saved, "image/png")
         except Exception as e:
             st.warning(f"Legend generation failed: {e}")
