@@ -7,6 +7,21 @@
 
 Build **DEMs** from GNSS/drone points, extract **contours**, compute **cut/fill volumes**, export **LandXML** surfaces for **Civil 3D**, and preview results in a lightweight **Streamlit** app.
 
+## Preview
+
+<p align="center">
+  <img src="assets/streamlit_viewer.png" width="860" alt="Streamlit viewer">
+</p>
+
+<p align="center">
+  <img src="assets/contours_preview.png" width="860" alt="Contours GeoJSON preview">
+</p>
+
+<p align="center">
+  <img src="assets/report_preview.png" width="860" alt="QA/QC HTML report">
+</p>
+
+
 > **Why it matters:** This repo demonstrates end-to-end surveying & GIS skills: CRS handling, interpolation, raster & vector outputs, volume analysis, and CAD interoperability.
 
 ---
