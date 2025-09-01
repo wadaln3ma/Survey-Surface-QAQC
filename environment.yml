@@ -12,8 +12,9 @@ dependencies:
   - pillow
   - matplotlib
   - affine
-  - scikit-image        # ← add this
+  - scikit-image
   - pip
   - pip:
       - streamlit
       - streamlit-folium
+      - typer                 # <-- add this

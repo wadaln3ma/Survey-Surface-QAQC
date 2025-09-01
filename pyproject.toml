@@ -18,6 +18,7 @@ dependencies = [
   "matplotlib>=3.7",
   "affine>=2.4",
   "scikit-image>=0.22",
+  "typer>=0.9",                 # <-- add this
 ]
 
 [project.optional-dependencies]
@@ -26,14 +27,11 @@ app = ["streamlit>=1.31", "streamlit-folium>=0.18"]
 [tool.setuptools]
 include-package-data = true
 
-# 🚫 Explicitly control which dirs become Python packages
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["survey_surface", "survey_surface.*"]
 exclude = ["tests*", "docs*", "assets*", "data*"]
 
-# (Optional) include non-Python files that live INSIDE survey_surface/
-# Adjust patterns to what you actually have there.
 [tool.setuptools.package-data]
 survey_surface = [
   "assets/**",
