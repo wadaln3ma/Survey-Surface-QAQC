@@ -3,7 +3,7 @@ name = "survey-surface"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
-  "numpy>=1.26",           # wheels available on Linux CI
+  "numpy>=1.26",
   "pandas>=1.5",
   "geopandas>=0.13",
   "rasterio>=1.3",
@@ -16,13 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-app = [
-  "streamlit>=1.31",
-  "streamlit-folium>=0.18",
-]
+app = ["streamlit>=1.31", "streamlit-folium>=0.18"]
 
 [tool.setuptools.packages.find]
 include = ["survey_surface*"]
-
-[project.scripts]
-survey-surface = "survey_surface.cli:main"

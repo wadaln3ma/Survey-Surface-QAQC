@@ -1,57 +1,44 @@
 name: CI
-
-on:
-  push:
-  pull_request:
+on: [push, pull_request]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Miniforge (Conda)
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v1
         with:
-          environment-file: environment.yml
-          activate-environment: qaqc
-          use-mamba: true
-          auto-activate-base: false
-          python-version: "3.11"
+          micromamba-version: latest             # <-- valid values: latest or 1.2.3-0 style
+          environment-file: environment.yml      # must exist and include "name: qaqc"
+          environment-name: qaqc                 # optional; overrides name in file
+          cache-environment: true
+          cache-downloads: true
+          create-args: >-
+            python=3.11
 
       - name: Show environment
-        shell: bash -l {0}
-        run: |
-          which python
-          python -V
-          conda list | grep -E 'numpy|geopandas|rasterio|shapely|scipy|folium|streamlit|matplotlib|pillow|affine' || true
+        run: micromamba run -n qaqc bash -lc "python -V && which python"
 
       - name: Install package (editable)
-        shell: bash -l {0}
-        run: pip install -e .[app]
+        run: micromamba run -n qaqc pip install -e .[app]
 
-      # ---- Mini pipeline smoke test (writes small outputs) ----
-      - name: Run mini pipeline
-        shell: bash -l {0}
+      - name: Mini pipeline smoke test
         run: |
-          python - <<'PY'
+          micromamba run -n qaqc python - <<'PY'
           import numpy as np
           from pathlib import Path
           from affine import Affine
           from survey_surface.grid import write_geotiff
           from survey_surface.contours import contours_geojson_from_raster
-
           Path("outputs").mkdir(exist_ok=True)
-          arr = (np.random.rand(60, 60) * 12.0 + 500.0).astype("float64")
+          arr = (np.random.rand(60, 60) * 12.0 + 500.0)
           transform = Affine.translation(500000, 2500000) * Affine.scale(2.0, -2.0)
           write_geotiff("outputs/dem.tif", arr, transform, "EPSG:32638")
           contours_geojson_from_raster("outputs/dem.tif", 1.0, "outputs/contours.geojson")
           print("OK: wrote outputs/dem.tif and outputs/contours.geojson")
           PY
 
-      # Optional: run your CLI entrypoint just to import/execute
-      - name: Import CLI (sanity)
-        shell: bash -l {0}
-        run: python -c "import importlib; importlib.import_module('survey_surface.cli'); print('CLI import OK')"
+      - name: CLI import (sanity)
+        run: micromamba run -n qaqc python -c "import importlib; importlib.import_module('survey_surface.cli'); print('CLI import OK')"
