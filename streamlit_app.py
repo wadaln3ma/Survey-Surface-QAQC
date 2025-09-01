@@ -106,21 +106,47 @@ def _bounds_from_raster(dem_path: str):
         return [[src.bounds.bottom, src.bounds.left], [src.bounds.top, src.bounds.right]]
 
 
-def _build_map(contours_path: Optional[str], bounds: Optional[list],
-               hillshade_png: Optional[str], hillshade_bounds_latlon: Optional[list],
-               hs_opacity: float) -> folium.Map:
-    # Center Riyadh-ish as fallback
+def _build_map(
+    contours_path: Optional[str],
+    bounds: Optional[list],
+    hillshade_png: Optional[str],
+    hillshade_bounds_latlon: Optional[list],
+    hs_opacity: float,
+) -> folium.Map:
+    # Riyadh-ish fallback center
     center = [24.7136, 46.6753]
     m = folium.Map(location=center, zoom_start=12, control_scale=True)
 
-    # Basemaps
-    folium.TileLayer("OpenStreetMap", name="OSM", control=True).add_to(m)
-    folium.TileLayer("Stamen Terrain", name="Terrain", control=True).add_to(m)
+    # --- Basemaps with explicit attribution (no API keys required) ---
     folium.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="© OpenStreetMap contributors",
+        name="OpenStreetMap",
+        control=True,
+    ).add_to(m)
+
+    folium.TileLayer(  # Topographic
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles © Esri — Sources: Esri, Garmin, USGS, NOAA, FAO, NPS, NRCan, GeoBase, IGN, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), OpenStreetMap contributors, and the GIS User Community",
+        name="Topographic",
+        control=True,
+    ).add_to(m)
+
+    folium.TileLayer(  # Satellite imagery
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
+        attr="Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
         name="Satellite",
         control=True,
+    ).add_to(m)
+
+    # Optional labels overlay (turn on with Satellite for a 'Hybrid' look)
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+        attr="Labels © Esri",
+        name="Hybrid Labels",
+        control=True,
+        overlay=True,
+        show=False,
     ).add_to(m)
 
     # Hillshade overlay (PNG with alpha), georeferenced to EPSG:4326 bounds
@@ -138,6 +164,7 @@ def _build_map(contours_path: Optional[str], bounds: Optional[list],
         except Exception as e:
             st.warning(f"Could not add hillshade overlay: {e}")
 
+    # Contours overlay
     if contours_path and os.path.exists(contours_path):
         try:
             with open(contours_path, "r", encoding="utf-8") as f:
@@ -162,7 +189,6 @@ def _build_map(contours_path: Optional[str], bounds: Optional[list],
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
-
 
 def _download_button(label: str, path: str, mime: str):
     if path and os.path.exists(path):
