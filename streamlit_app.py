@@ -13,7 +13,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from PIL import Image, ImageDraw  # PNG overlays + drawing
+from PIL import Image, ImageDraw, ImageFont  # PNG overlays + drawing
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
@@ -52,13 +52,16 @@ def _save_uploaded_file(uploaded, dest: Path) -> Path:
     return dest
 
 def _reset_outputs():
-    # Clear outputs directory and Streamlit caches
     if OUT_DIR.exists():
         shutil.rmtree(OUT_DIR)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     st.cache_data.clear()
+    # clear any stored scale values
+    for k in ["cr_vmin", "cr_vmax"]:
+        if k in st.session_state:
+            del st.session_state[k]
     st.success("Outputs and cache cleared.")
-    st.rerun()  # restart app run cleanly
+    st.rerun()
 
 @st.cache_data(show_spinner=False)
 def _run_grid(csv_path: str, x: Optional[str], y: Optional[str],
@@ -125,7 +128,6 @@ def _hillshade(arr: np.ndarray, transform, azimuth: float = 315.0, altitude: flo
 
 @st.cache_data(show_spinner=False)
 def _make_hillshade_png(dem_path: str, azimuth: float, altitude: float, z_factor: float, out_png: str) -> Tuple[str, list]:
-    from rasterio.transform import array_bounds
     with rasterio.open(dem_path) as src:
         arr = src.read(1).astype("float64")
         if src.nodata is not None:
@@ -155,7 +157,25 @@ def _make_hillshade_png(dem_path: str, azimuth: float, altitude: float, z_factor
         bounds_latlon = [[south, west], [north, east]]
     return out_png, bounds_latlon
 
-# ---------------------------- COLOR RELIEF ----------------------------
+# ---------------------------- COLOR RELIEF + SCALE ----------------------------
+def _compute_vmin_vmax_from_dem(dem_path: str, vmin_mode: str, vmax_mode: str,
+                                custom_min: Optional[float], custom_max: Optional[float]) -> Tuple[float, float]:
+    with rasterio.open(dem_path) as src:
+        arr = src.read(1).astype("float64")
+        if src.nodata is not None:
+            arr = np.where(arr == src.nodata, np.nan, arr)
+        if vmin_mode == "auto" or custom_min is None:
+            vmin = float(np.nanpercentile(arr, 2.0))
+        else:
+            vmin = float(custom_min)
+        if vmax_mode == "auto" or custom_max is None:
+            vmax = float(np.nanpercentile(arr, 98.0))
+        else:
+            vmax = float(custom_max)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+            vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
+    return vmin, vmax
+
 @st.cache_data(show_spinner=False)
 def _make_colorrelief_png(
     dem_path: str,
@@ -165,8 +185,11 @@ def _make_colorrelief_png(
     custom_min: Optional[float],
     custom_max: Optional[float],
     out_png: str
-) -> Tuple[str, list]:
-    from rasterio.transform import array_bounds
+) -> Tuple[str, list, float, float]:
+    """
+    Reproject DEM to EPSG:4326, normalize via vmin/vmax, colorize, export RGBA PNG + bounds,
+    and RETURN the vmin/vmax actually used (for legend).
+    """
     with rasterio.open(dem_path) as src:
         arr = src.read(1).astype("float64")
         if src.nodata is not None:
@@ -190,6 +213,7 @@ def _make_colorrelief_png(
         data = dst.copy()
         data[dst_valid == 0] = np.nan
 
+        # decide vmin/vmax on the reprojected grid (consistent with display)
         if vmin_mode == "auto" or custom_min is None:
             vmin = float(np.nanpercentile(data, 2.0))
         else:
@@ -198,7 +222,7 @@ def _make_colorrelief_png(
             vmax = float(np.nanpercentile(data, 98.0))
         else:
             vmax = float(custom_max)
-        if vmin >= vmax:
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
             vmin, vmax = float(np.nanmin(data)), float(np.nanmax(data))
 
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
@@ -211,7 +235,51 @@ def _make_colorrelief_png(
         south, west, north, east = array_bounds(height, width, transform_out)
         bounds_latlon = [[south, west], [north, east]]
 
-    return out_png, bounds_latlon
+    return out_png, bounds_latlon, vmin, vmax
+
+def _make_colorramp_legend_png(cmap_name: str, vmin: float, vmax: float,
+                               out_png: str, width: int = 420, height: int = 80) -> str:
+    """
+    Create a horizontal color ramp legend PNG with vmin/vmax labels.
+    """
+    # Gradient (0..1 across width)
+    x = np.linspace(0, 1, width)
+    grad = np.tile(x, (height, 1))
+    mapper = cm.get_cmap(cmap_name)
+    rgba_f = mapper(grad)  # (H, W, 4), floats 0..1
+    rgba = (rgba_f * 255).astype("uint8")
+    img = Image.fromarray(rgba, mode="RGBA")
+
+    # Border + labels
+    draw = ImageDraw.Draw(img, "RGBA")
+    draw.rectangle([0, 0, width-1, height-1], outline=(255, 255, 255, 180), width=1)
+
+    # Try to use a common font, fallback to default
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 16)
+        font_b = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+    except:
+        font = ImageFont.load_default()
+        font_b = ImageFont.load_default()
+
+    # Title
+    title = f"Elevation (m) – {cmap_name}"
+    tw, th = draw.textsize(title, font=font_b)
+    draw.rectangle([10, 6, 10 + tw + 8, 6 + th + 4], fill=(0, 0, 0, 90))
+    draw.text((14, 8), title, fill=(255, 255, 255, 230), font=font_b)
+
+    # Labels (vmin, mid, vmax)
+    lbl_pad = 6
+    labels = [(0, f"{vmin:.2f}"), (width//2, f"{(vmin+vmax)/2:.2f}"), (width-1, f"{vmax:.2f}")]
+    for x_pos, txt in labels:
+        tw, th = draw.textsize(txt, font=font)
+        bx = max(2, min(width - tw - 2, x_pos - tw // 2))
+        by = height - th - 6
+        draw.rectangle([bx-2, by-2, bx+tw+2, by+th+2], fill=(0, 0, 0, 90))
+        draw.text((bx, by), txt, fill=(255, 255, 255, 230), font=font)
+
+    img.save(out_png, "PNG")
+    return out_png
 
 # ---------------------------- COMPOSITE EXPORT ----------------------------
 def _read_png_rgba(path: str) -> Image.Image:
@@ -225,30 +293,21 @@ def _apply_opacity(img: Image.Image, alpha: float) -> Image.Image:
 
 def _draw_contours_on(img: Image.Image, contours_geojson_path: str, bounds_latlon: list,
                       color: tuple = (255, 255, 255, 220), width: int = 2) -> Image.Image:
-    """
-    Draw contours from GeoJSON onto the RGBA image using bounds to map lat/lon → pixels.
-    color is RGBA, width is line width in pixels.
-    """
     if not os.path.exists(contours_geojson_path):
         return img
     with open(contours_geojson_path, "r", encoding="utf-8") as f:
         gj = json.load(f)
-
     (south, west), (north, east) = bounds_latlon
     W, H = img.size
     draw = ImageDraw.Draw(img, "RGBA")
-
     def to_px(lat, lon):
         x = (lon - west) / (east - west) * W
         y = (1.0 - (lat - south) / (north - south)) * H
         return (x, y)
-
     def draw_coords(coords):
-        # coords is list of [lon, lat]
         pts = [to_px(lat=lat, lon=lon) for lon, lat in coords]
         if len(pts) >= 2:
             draw.line(pts, fill=color, width=width)
-
     for feat in gj.get("features", []):
         geom = feat.get("geometry", {})
         t = geom.get("type")
@@ -260,8 +319,6 @@ def _draw_contours_on(img: Image.Image, contours_geojson_path: str, bounds_latlo
         elif t == "MultiLineString":
             for part in coords:
                 draw_coords(part)
-        # (Polygons not expected for contours, ignore others)
-
     return img
 
 def _export_composite_png(
@@ -273,10 +330,6 @@ def _export_composite_png(
     cr_opacity: float,
     hs_opacity: float
 ) -> Optional[str]:
-    """
-    Compose (Color Relief × Hillshade × Contours) into a single PNG (no basemap).
-    Returns the saved path or None if nothing to compose.
-    """
     layers = []
     if colorrelief_png and os.path.exists(colorrelief_png):
         layers.append(("cr", colorrelief_png, cr_opacity))
@@ -284,23 +337,16 @@ def _export_composite_png(
         layers.append(("hs", hillshade_png, hs_opacity))
     if not layers:
         return None
-
-    # Base is the first layer (color relief preferred if present)
     base_tag, base_path, base_opacity = layers[0]
     base_img = _apply_opacity(_read_png_rgba(base_path), base_opacity)
-
-    # Ensure subsequent layers match size
     for tag, pth, op in layers[1:]:
         img = _apply_opacity(_read_png_rgba(pth), op)
         if img.size != base_img.size:
             img = img.resize(base_img.size, Image.BILINEAR)
         base_img = Image.alpha_composite(base_img, img)
-
-    # Draw contours on top if provided
     if contours_geojson and bounds_latlon:
         base_img = _draw_contours_on(base_img, contours_geojson, bounds_latlon,
                                      color=(255, 255, 255, 235), width=2)
-
     base_img.save(out_path, "PNG")
     return out_path
 
@@ -317,11 +363,8 @@ def _build_map(
     hillshade_bounds: Optional[list],
     hs_opacity: float,
 ) -> folium.Map:
-    # Riyadh-ish fallback center
     center = [24.7136, 46.6753]
     m = folium.Map(location=center, zoom_start=12, control_scale=True)
-
-    # Basemaps with explicit attribution
     base_defs = {
         "OpenStreetMap": dict(
             tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -346,8 +389,6 @@ def _build_map(
             control=False,
             show=(name == basemap_choice),
         ).add_to(m)
-
-    # Optional labels overlay (for 'Hybrid' look)
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
         attr="Labels © Esri",
@@ -356,8 +397,6 @@ def _build_map(
         overlay=True,
         show=(hybrid_labels and basemap_choice == "Satellite"),
     ).add_to(m)
-
-    # Color relief overlay
     if colorrelief_png and os.path.exists(colorrelief_png) and colorrelief_bounds:
         folium.raster_layers.ImageOverlay(
             name="Color Relief",
@@ -368,8 +407,6 @@ def _build_map(
             cross_origin=False,
             zindex=300,
         ).add_to(m)
-
-    # Hillshade overlay
     if hillshade_png and os.path.exists(hillshade_png) and hillshade_bounds:
         folium.raster_layers.ImageOverlay(
             name="Hillshade",
@@ -380,17 +417,13 @@ def _build_map(
             cross_origin=False,
             zindex=400,
         ).add_to(m)
-
-    # Contours overlay
     if contours_path and os.path.exists(contours_path):
         try:
             with open(contours_path, "r", encoding="utf-8") as f:
                 gj = json.load(f)
-
             def _style(feature):
                 elev = feature.get("properties", {}).get("elev", 0.0)
                 return {"color": "#7c3aed" if elev else "#0ea5e9", "weight": 2, "opacity": 0.9}
-
             folium.GeoJson(
                 gj,
                 name="Contours",
@@ -400,10 +433,8 @@ def _build_map(
             ).add_to(m)
         except Exception as e:
             st.warning(f"Could not render contours: {e}")
-
     if bounds:
         m.fit_bounds(bounds, padding=(10, 10))
-
     folium.LayerControl(collapsed=False).add_to(m)
     return m
 
@@ -487,7 +518,6 @@ if mode == "Quick Demo (auto-generate)":
     st.write("We’ll generate synthetic points near Riyadh, build a DEM, draw contours, compute volumes, and export LandXML — all in a few seconds.")
     run = st.button("▶️ Run Demo Now", type="primary")
     if run:
-        # Synthetic CSV
         csv_path = DATA_DIR / "sample_points.csv"
         import csv, math, random
         random.seed(42)
@@ -581,12 +611,11 @@ with tabs[0]:
 
     # Build overlays
     cr_png, cr_bounds = None, None
-    if 'cr_on' in st.session_state:
-        pass  # just to quiet linters about unused
-    if (st.session_state.get('cr_on', True) or True) and cr_on and dem_path and os.path.exists(dem_path):
+    cr_vmin, cr_vmax = None, None
+    if cr_on and dem_path and os.path.exists(dem_path):
         try:
             cr_png_path = str(OUT_DIR / "color_relief.png")
-            cr_png, cr_bounds = _make_colorrelief_png(
+            cr_png, cr_bounds, cr_vmin, cr_vmax = _make_colorrelief_png(
                 dem_path,
                 cmap_name=cr_cmap,
                 vmin_mode=cr_min_mode,
@@ -595,6 +624,9 @@ with tabs[0]:
                 custom_max=cr_max_val if cr_max_mode == "custom" else None,
                 out_png=cr_png_path,
             )
+            # store for Downloads tab
+            st.session_state["cr_vmin"] = cr_vmin
+            st.session_state["cr_vmax"] = cr_vmax
         except Exception as e:
             st.warning(f"Could not compute color relief: {e}")
 
@@ -609,7 +641,7 @@ with tabs[0]:
     m = _build_map(
         contours_path=contours_path,
         bounds=dem_bounds,
-        basemap_choice=st.session_state.get('basemap_choice', 'Satellite') if 'basemap_choice' in st.session_state else "Satellite",
+        basemap_choice=basemap_choice,
         hybrid_labels=hybrid_labels,
         colorrelief_png=cr_png,
         colorrelief_bounds=cr_bounds,
@@ -667,8 +699,8 @@ with tabs[2]:
     _download_button("Download LandXML (TIN)", landxml_path or "", "application/xml")
 
     st.markdown("—")
-    st.markdown("**Map export (overlays only)**")
-    if st.button("🖼️ Compose overlays to PNG"):
+    st.markdown("**Map & Legend export (overlays only)**")
+    if st.button("🖼️ Compose overlays to PNG + legend"):
         # Ensure overlays exist with current params; reuse earlier if created
         cr_png_path = str(OUT_DIR / "color_relief.png") if cr_on else None
         hs_png_path = str(OUT_DIR / "hillshade.png") if hs_on else None
@@ -676,7 +708,7 @@ with tabs[2]:
         # If missing, try to create from DEM
         if cr_on and (not cr_png_path or not os.path.exists(cr_png_path)):
             try:
-                cr_png_path, cr_bounds_tmp = _make_colorrelief_png(
+                cr_png_path, cr_bounds_tmp, vmin_used, vmax_used = _make_colorrelief_png(
                     dem_path,
                     cmap_name=cr_cmap,
                     vmin_mode=cr_min_mode,
@@ -687,6 +719,8 @@ with tabs[2]:
                 )
                 if 'cr_bounds' not in locals() or cr_bounds is None:
                     cr_bounds = cr_bounds_tmp
+                st.session_state["cr_vmin"] = vmin_used
+                st.session_state["cr_vmax"] = vmax_used
             except Exception as e:
                 st.error(f"Failed to compute color relief: {e}")
 
@@ -719,6 +753,25 @@ with tabs[2]:
         else:
             st.info("Nothing to compose yet. Generate overlays first (run demo or upload CSV).")
 
+        # Legend PNG (separate)
+        legend_path = str(OUT_DIR / "color_relief_legend.png")
+        # Use stored scale; if missing, compute from DEM in its native grid (fine for labels)
+        vmin = st.session_state.get("cr_vmin")
+        vmax = st.session_state.get("cr_vmax")
+        if (vmin is None) or (vmax is None):
+            vmin, vmax = _compute_vmin_vmax_from_dem(
+                dem_path,
+                cr_min_mode,
+                cr_max_mode,
+                cr_min_val if cr_min_mode == "custom" else None,
+                cr_max_val if cr_max_mode == "custom" else None,
+            )
+        try:
+            legend_saved = _make_colorramp_legend_png(cr_cmap, vmin, vmax, legend_path)
+            _download_button("Download Legend (PNG)", legend_saved, "image/png")
+        except Exception as e:
+            st.warning(f"Legend generation failed: {e}")
+
     if not ((dem_path and os.path.exists(dem_path)) or (contours_path and os.path.exists(contours_path))):
         st.info("Run the demo or upload your CSV to generate files first.")
 
@@ -733,7 +786,8 @@ with tabs[3]:
         5. **LandXML** export (Delaunay TIN) for Civil 3D  
         6. **Report**: HTML summary of raster stats  
         
-        **PNG export** composes **Color Relief + Hillshade + Contours** (no basemap) for a clean, shareable image that is license-safe and reproducible offline.
+        **PNG export** composes **Color Relief + Hillshade + Contours** (no basemap) for a clean, shareable image.  
+        A **Legend PNG** is generated using the same colormap and scale as the overlay.
         """
     )
 
