@@ -1,0 +1,3 @@
+recursive-include survey_surface/assets *
+recursive-include survey_surface/templates *
+recursive-include survey_surface/resources *
