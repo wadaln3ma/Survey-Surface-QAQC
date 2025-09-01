@@ -2,6 +2,7 @@
 import os
 import io
 import json
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -12,8 +13,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-from PIL import Image  # for PNG overlays
-import matplotlib
+from PIL import Image, ImageDraw  # PNG overlays + drawing
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
@@ -50,6 +50,15 @@ def _save_uploaded_file(uploaded, dest: Path) -> Path:
     with open(dest, "wb") as f:
         f.write(uploaded.getbuffer())
     return dest
+
+def _reset_outputs():
+    # Clear outputs directory and Streamlit caches
+    if OUT_DIR.exists():
+        shutil.rmtree(OUT_DIR)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    st.cache_data.clear()
+    st.success("Outputs and cache cleared.")
+    st.rerun()  # restart app run cleanly
 
 @st.cache_data(show_spinner=False)
 def _run_grid(csv_path: str, x: Optional[str], y: Optional[str],
@@ -116,6 +125,7 @@ def _hillshade(arr: np.ndarray, transform, azimuth: float = 315.0, altitude: flo
 
 @st.cache_data(show_spinner=False)
 def _make_hillshade_png(dem_path: str, azimuth: float, altitude: float, z_factor: float, out_png: str) -> Tuple[str, list]:
+    from rasterio.transform import array_bounds
     with rasterio.open(dem_path) as src:
         arr = src.read(1).astype("float64")
         if src.nodata is not None:
@@ -150,23 +160,19 @@ def _make_hillshade_png(dem_path: str, azimuth: float, altitude: float, z_factor
 def _make_colorrelief_png(
     dem_path: str,
     cmap_name: str,
-    vmin_mode: str,  # 'auto' or 'custom'
-    vmax_mode: str,  # 'auto' or 'custom'
+    vmin_mode: str,
+    vmax_mode: str,
     custom_min: Optional[float],
     custom_max: Optional[float],
     out_png: str
 ) -> Tuple[str, list]:
-    """
-    Reproject DEM to EPSG:4326, normalize to [0,1] via chosen vmin/vmax,
-    colorize using matplotlib colormap, export RGBA PNG + lat/lon bounds.
-    """
+    from rasterio.transform import array_bounds
     with rasterio.open(dem_path) as src:
         arr = src.read(1).astype("float64")
         if src.nodata is not None:
             arr = np.where(arr == src.nodata, np.nan, arr)
         valid = np.isfinite(arr)
 
-        # Reproject to 4326 first (to colorize in final grid)
         dst_crs = "EPSG:4326"
         transform_out, width, height = calculate_default_transform(src.crs, dst_crs, src.width, src.height, *src.bounds)
         dst = np.full((height, width), np.nan, dtype="float64")
@@ -184,7 +190,6 @@ def _make_colorrelief_png(
         data = dst.copy()
         data[dst_valid == 0] = np.nan
 
-        # Determine vmin/vmax
         if vmin_mode == "auto" or custom_min is None:
             vmin = float(np.nanpercentile(data, 2.0))
         else:
@@ -199,9 +204,7 @@ def _make_colorrelief_png(
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
         mapper = cm.get_cmap(cmap_name)
         rgba_f = mapper(norm(np.where(np.isfinite(data), data, np.nan)))
-        # Replace NaNs with transparent
-        nan_mask = ~np.isfinite(data)
-        rgba_f[nan_mask] = [0, 0, 0, 0]
+        rgba_f[~np.isfinite(data)] = [0, 0, 0, 0]
         rgba = (rgba_f * 255).astype("uint8")
         Image.fromarray(rgba, mode="RGBA").save(out_png, "PNG")
 
@@ -209,6 +212,97 @@ def _make_colorrelief_png(
         bounds_latlon = [[south, west], [north, east]]
 
     return out_png, bounds_latlon
+
+# ---------------------------- COMPOSITE EXPORT ----------------------------
+def _read_png_rgba(path: str) -> Image.Image:
+    im = Image.open(path).convert("RGBA")
+    return im
+
+def _apply_opacity(img: Image.Image, alpha: float) -> Image.Image:
+    r, g, b, a = img.split()
+    a = a.point(lambda v: int(v * float(alpha)))
+    return Image.merge("RGBA", (r, g, b, a))
+
+def _draw_contours_on(img: Image.Image, contours_geojson_path: str, bounds_latlon: list,
+                      color: tuple = (255, 255, 255, 220), width: int = 2) -> Image.Image:
+    """
+    Draw contours from GeoJSON onto the RGBA image using bounds to map lat/lon → pixels.
+    color is RGBA, width is line width in pixels.
+    """
+    if not os.path.exists(contours_geojson_path):
+        return img
+    with open(contours_geojson_path, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+
+    (south, west), (north, east) = bounds_latlon
+    W, H = img.size
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    def to_px(lat, lon):
+        x = (lon - west) / (east - west) * W
+        y = (1.0 - (lat - south) / (north - south)) * H
+        return (x, y)
+
+    def draw_coords(coords):
+        # coords is list of [lon, lat]
+        pts = [to_px(lat=lat, lon=lon) for lon, lat in coords]
+        if len(pts) >= 2:
+            draw.line(pts, fill=color, width=width)
+
+    for feat in gj.get("features", []):
+        geom = feat.get("geometry", {})
+        t = geom.get("type")
+        coords = geom.get("coordinates")
+        if not coords:
+            continue
+        if t == "LineString":
+            draw_coords(coords)
+        elif t == "MultiLineString":
+            for part in coords:
+                draw_coords(part)
+        # (Polygons not expected for contours, ignore others)
+
+    return img
+
+def _export_composite_png(
+    out_path: str,
+    colorrelief_png: Optional[str],
+    hillshade_png: Optional[str],
+    contours_geojson: Optional[str],
+    bounds_latlon: Optional[list],
+    cr_opacity: float,
+    hs_opacity: float
+) -> Optional[str]:
+    """
+    Compose (Color Relief × Hillshade × Contours) into a single PNG (no basemap).
+    Returns the saved path or None if nothing to compose.
+    """
+    layers = []
+    if colorrelief_png and os.path.exists(colorrelief_png):
+        layers.append(("cr", colorrelief_png, cr_opacity))
+    if hillshade_png and os.path.exists(hillshade_png):
+        layers.append(("hs", hillshade_png, hs_opacity))
+    if not layers:
+        return None
+
+    # Base is the first layer (color relief preferred if present)
+    base_tag, base_path, base_opacity = layers[0]
+    base_img = _apply_opacity(_read_png_rgba(base_path), base_opacity)
+
+    # Ensure subsequent layers match size
+    for tag, pth, op in layers[1:]:
+        img = _apply_opacity(_read_png_rgba(pth), op)
+        if img.size != base_img.size:
+            img = img.resize(base_img.size, Image.BILINEAR)
+        base_img = Image.alpha_composite(base_img, img)
+
+    # Draw contours on top if provided
+    if contours_geojson and bounds_latlon:
+        base_img = _draw_contours_on(base_img, contours_geojson, bounds_latlon,
+                                     color=(255, 255, 255, 235), width=2)
+
+    base_img.save(out_path, "PNG")
+    return out_path
 
 # ---------------------------- MAP BUILDER ----------------------------
 def _build_map(
@@ -227,8 +321,7 @@ def _build_map(
     center = [24.7136, 46.6753]
     m = folium.Map(location=center, zoom_start=12, control_scale=True)
 
-    # --- Basemaps with explicit attribution ---
-    # Only the selected one is shown=True to feel like a picker.
+    # Basemaps with explicit attribution
     base_defs = {
         "OpenStreetMap": dict(
             tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -250,11 +343,11 @@ def _build_map(
             tiles=cfg["tiles"],
             attr=cfg["attr"],
             name=name,
-            control=False,  # hide base layers from control (we present a sidebar picker)
+            control=False,
             show=(name == basemap_choice),
         ).add_to(m)
 
-    # Optional labels overlay (for Hybrid with Satellite)
+    # Optional labels overlay (for 'Hybrid' look)
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
         attr="Labels © Esri",
@@ -264,7 +357,7 @@ def _build_map(
         show=(hybrid_labels and basemap_choice == "Satellite"),
     ).add_to(m)
 
-    # Color relief overlay (below hillshade)
+    # Color relief overlay
     if colorrelief_png and os.path.exists(colorrelief_png) and colorrelief_bounds:
         folium.raster_layers.ImageOverlay(
             name="Color Relief",
@@ -354,7 +447,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Overlays")
-    # Color relief controls
     cr_on = st.checkbox("Enable Color Relief", value=True)
     cr_cmap = st.selectbox("Colormap", ["viridis", "terrain", "plasma", "magma", "cividis"], index=0)
     cr_opacity = st.slider("Color Relief opacity", 0.1, 1.0, 0.85, 0.05)
@@ -366,7 +458,6 @@ with st.sidebar:
         cr_max_mode = st.selectbox("Max scale", ["auto", "custom"], index=0)
         cr_max_val = st.number_input("Custom max (m)", value=1000.0, step=1.0, disabled=(cr_max_mode=="auto"))
 
-    # Hillshade controls
     st.markdown("—")
     hs_on = st.checkbox("Enable Hillshade", value=True)
     hs_az = st.slider("Hillshade azimuth (°)", 0, 360, 315, 1, disabled=not hs_on)
@@ -378,6 +469,11 @@ with st.sidebar:
     st.markdown("### Basemap")
     basemap_choice = st.radio("Base", ["OpenStreetMap", "Topographic", "Satellite"], index=2, horizontal=True)
     hybrid_labels = st.checkbox("Hybrid labels (with Satellite)", value=True)
+
+    st.markdown("---")
+    st.markdown("### Maintenance")
+    if st.button("♻️ Reset outputs & cache", help="Clears outputs/ and cache, then reloads the app."):
+        _reset_outputs()
 
     st.markdown("---")
     st.caption("💡 For Riyadh, UTM Zone 38N = EPSG:32638")
@@ -485,7 +581,9 @@ with tabs[0]:
 
     # Build overlays
     cr_png, cr_bounds = None, None
-    if cr_on and dem_path and os.path.exists(dem_path):
+    if 'cr_on' in st.session_state:
+        pass  # just to quiet linters about unused
+    if (st.session_state.get('cr_on', True) or True) and cr_on and dem_path and os.path.exists(dem_path):
         try:
             cr_png_path = str(OUT_DIR / "color_relief.png")
             cr_png, cr_bounds = _make_colorrelief_png(
@@ -511,7 +609,7 @@ with tabs[0]:
     m = _build_map(
         contours_path=contours_path,
         bounds=dem_bounds,
-        basemap_choice=basemap_choice,
+        basemap_choice=st.session_state.get('basemap_choice', 'Satellite') if 'basemap_choice' in st.session_state else "Satellite",
         hybrid_labels=hybrid_labels,
         colorrelief_png=cr_png,
         colorrelief_bounds=cr_bounds,
@@ -524,7 +622,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("DEM Statistics")
-    if stats:
+    if 'stats' in locals() and stats:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Min (m)", f"{stats['min']:.2f}")
         c2.metric("Max (m)", f"{stats['max']:.2f}")
@@ -567,6 +665,60 @@ with tabs[2]:
     _download_button("Download Contours (GeoJSON)", contours_path or "", "application/geo+json")
     _download_button("Download QA/QC Report (HTML)", report_path or "", "text/html")
     _download_button("Download LandXML (TIN)", landxml_path or "", "application/xml")
+
+    st.markdown("—")
+    st.markdown("**Map export (overlays only)**")
+    if st.button("🖼️ Compose overlays to PNG"):
+        # Ensure overlays exist with current params; reuse earlier if created
+        cr_png_path = str(OUT_DIR / "color_relief.png") if cr_on else None
+        hs_png_path = str(OUT_DIR / "hillshade.png") if hs_on else None
+
+        # If missing, try to create from DEM
+        if cr_on and (not cr_png_path or not os.path.exists(cr_png_path)):
+            try:
+                cr_png_path, cr_bounds_tmp = _make_colorrelief_png(
+                    dem_path,
+                    cmap_name=cr_cmap,
+                    vmin_mode=cr_min_mode,
+                    vmax_mode=cr_max_mode,
+                    custom_min=cr_min_val if cr_min_mode == "custom" else None,
+                    custom_max=cr_max_val if cr_max_mode == "custom" else None,
+                    out_png=str(OUT_DIR / "color_relief.png"),
+                )
+                if 'cr_bounds' not in locals() or cr_bounds is None:
+                    cr_bounds = cr_bounds_tmp
+            except Exception as e:
+                st.error(f"Failed to compute color relief: {e}")
+
+        if hs_on and (not hs_png_path or not os.path.exists(hs_png_path)):
+            try:
+                hs_png_path, hs_bounds_tmp = _make_hillshade_png(
+                    dem_path, hs_az, hs_alt, hs_z, str(OUT_DIR / "hillshade.png")
+                )
+                if 'hs_bounds' not in locals() or hs_bounds is None:
+                    hs_bounds = hs_bounds_tmp
+            except Exception as e:
+                st.error(f"Failed to compute hillshade: {e}")
+
+        # Choose bounds (prefer color relief bounds; else hillshade)
+        bounds_latlon = cr_bounds or hs_bounds or None
+
+        out_png = str(OUT_DIR / "map_overlays_composite.png")
+        saved = _export_composite_png(
+            out_path=out_png,
+            colorrelief_png=cr_png_path if cr_on else None,
+            hillshade_png=hs_png_path if hs_on else None,
+            contours_geojson=contours_path if contours_path and os.path.exists(contours_path) else None,
+            bounds_latlon=bounds_latlon,
+            cr_opacity=cr_opacity,
+            hs_opacity=hs_opacity,
+        )
+        if saved:
+            st.success("Composite created.")
+            _download_button("Download Map (PNG, overlays only)", saved, "image/png")
+        else:
+            st.info("Nothing to compose yet. Generate overlays first (run demo or upload CSV).")
+
     if not ((dem_path and os.path.exists(dem_path)) or (contours_path and os.path.exists(contours_path))):
         st.info("Run the demo or upload your CSV to generate files first.")
 
@@ -581,7 +733,7 @@ with tabs[3]:
         5. **LandXML** export (Delaunay TIN) for Civil 3D  
         6. **Report**: HTML summary of raster stats  
         
-        For production-scale datasets, swap gridding to PDAL/GDAL and optionally enforce breaklines for TINs.
+        **PNG export** composes **Color Relief + Hillshade + Contours** (no basemap) for a clean, shareable image that is license-safe and reproducible offline.
         """
     )
 
