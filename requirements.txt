@@ -1,0 +1,13 @@
+numpy
+pandas
+geopandas
+pyproj
+shapely
+rasterio
+scikit-image
+typer[all]
+rich
+scipy
+streamlit
+folium
+streamlit-folium

@@ -1,0 +1,47 @@
+# --- Python / tooling ---
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.build/
+dist/
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- App outputs (generated artifacts) ---
+outputs/
+
+# --- Local data (keep small sample CSVs, ignore heavy rasters) ---
+# Keep: data/sample_points.csv
+# Ignore typical large geospatial rasters you might drop in data/
+data/**/*.tif
+data/**/*.tiff
+data/**/*.img
+data/**/*.vrt
+data/**/*.jp2
+data/**/*.ecw
+data/**/*.sid
+
+# --- Vector datasets that can get bulky ---
+data/**/*.gpkg
+data/**/*.gdb/
+data/**/*.sqlite
+
+# --- Optional secrets ---
+.env
+.env.*
