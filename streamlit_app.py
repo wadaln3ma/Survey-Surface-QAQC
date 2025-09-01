@@ -7,9 +7,12 @@ from typing import Optional, Tuple
 
 import numpy as np
 import rasterio
+from rasterio.transform import array_bounds
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+from PIL import Image  # for PNG overlay
 
 # Import your pipeline modules
 from survey_surface.io import read_points_csv
@@ -59,8 +62,6 @@ def _run_grid(csv_path: str, x: Optional[str], y: Optional[str],
     dem_path = str(OUT_DIR / "dem.tif")
     write_geotiff(dem_path, arr, transform, to_crs)
 
-    # Stats for UI
-    nodata = None
     a = arr.astype(float)
     stats = {
         "min": float(np.nanmin(a)),
@@ -102,11 +103,12 @@ def _run_landxml_from_csv(csv_path: str, x: Optional[str], y: Optional[str],
 
 def _bounds_from_raster(dem_path: str):
     with rasterio.open(dem_path) as src:
-        b = src.bounds
-    return [[b.bottom, b.left], [b.top, b.right]]
+        return [[src.bounds.bottom, src.bounds.left], [src.bounds.top, src.bounds.right]]
 
 
-def _build_map(contours_path: Optional[str], bounds: Optional[list]) -> folium.Map:
+def _build_map(contours_path: Optional[str], bounds: Optional[list],
+               hillshade_png: Optional[str], hillshade_bounds_latlon: Optional[list],
+               hs_opacity: float) -> folium.Map:
     # Center Riyadh-ish as fallback
     center = [24.7136, 46.6753]
     m = folium.Map(location=center, zoom_start=12, control_scale=True)
@@ -121,20 +123,29 @@ def _build_map(contours_path: Optional[str], bounds: Optional[list]) -> folium.M
         control=True,
     ).add_to(m)
 
+    # Hillshade overlay (PNG with alpha), georeferenced to EPSG:4326 bounds
+    if hillshade_png and os.path.exists(hillshade_png) and hillshade_bounds_latlon:
+        try:
+            folium.raster_layers.ImageOverlay(
+                name="Hillshade",
+                image=hillshade_png,
+                bounds=hillshade_bounds_latlon,
+                opacity=hs_opacity,
+                interactive=False,
+                cross_origin=False,
+                zindex=400,
+            ).add_to(m)
+        except Exception as e:
+            st.warning(f"Could not add hillshade overlay: {e}")
+
     if contours_path and os.path.exists(contours_path):
         try:
             with open(contours_path, "r", encoding="utf-8") as f:
                 gj = json.load(f)
 
-            # Style by elevation
             def _style(feature):
                 elev = feature.get("properties", {}).get("elev", 0.0)
-                # map elevation to a blue-purple palette
-                return {
-                    "color": "#6c5ce7" if elev else "#0ea5e9",
-                    "weight": 2,
-                    "opacity": 0.9,
-                }
+                return {"color": "#7c3aed" if elev else "#0ea5e9", "weight": 2, "opacity": 0.9}
 
             folium.GeoJson(
                 gj,
@@ -167,8 +178,80 @@ def _auto_demo_if_empty():
     return have_any
 
 
+# ---------------------------- HILLSHADE ----------------------------
+def _hillshade(arr: np.ndarray, transform, azimuth: float = 315.0, altitude: float = 45.0, z_factor: float = 1.0) -> np.ndarray:
+    """Compute hillshade (0..255) from DEM array using standard algorithm (radians)."""
+    # cell sizes (assume north-up)
+    dx = abs(transform.a)
+    dy = abs(transform.e)
+
+    # gradients (z units per meter); multiply by z_factor to exaggerate relief
+    gy, gx = np.gradient(arr * z_factor, dy, dx)
+    slope = np.arctan(np.hypot(gx, gy))
+    aspect = np.arctan2(-gy, gx)
+    az = np.deg2rad(azimuth)
+    alt = np.deg2rad(altitude)
+
+    shade = (np.cos(alt) * np.cos(slope)) + (np.sin(alt) * np.sin(slope) * np.cos(az - aspect))
+    shade = np.clip(shade, 0, 1)
+    return (shade * 255).astype("uint8")
+
+
+@st.cache_data(show_spinner=False)
+def _make_hillshade_png(dem_path: str, azimuth: float, altitude: float, z_factor: float, out_png: str) -> Tuple[str, list]:
+    """Compute hillshade in native CRS, then reproject to EPSG:4326 and save as RGBA PNG with alpha."""
+    with rasterio.open(dem_path) as src:
+        arr = src.read(1).astype("float64")
+        if src.nodata is not None:
+            arr = np.where(arr == src.nodata, np.nan, arr)
+
+        # mask invalids for hillshade calc
+        valid = np.isfinite(arr)
+        arr_filled = np.where(valid, arr, np.nanmean(arr))
+
+        hs = _hillshade(arr_filled, src.transform, azimuth=azimuth, altitude=altitude, z_factor=z_factor)
+        hs = np.where(valid, hs, 0).astype("uint8")  # set nodata to 0 (black/transparent later)
+
+        # Reproject hillshade to EPSG:4326 for Leaflet overlay
+        dst_crs = "EPSG:4326"
+        transform_out, width, height = calculate_default_transform(src.crs, dst_crs, src.width, src.height, *src.bounds)
+        dst = np.zeros((height, width), dtype="uint8")
+        reproject(
+            source=hs,
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=transform_out,
+            dst_crs=dst_crs,
+            resampling=Resampling.bilinear,
+        )
+
+        # Build RGBA image with transparency where no data (value==0 AND original was invalid)
+        # Reproject validity mask too (nearest) to keep transparency correct
+        dst_valid = np.zeros((height, width), dtype="uint8")
+        reproject(
+            source=valid.astype("uint8"),
+            destination=dst_valid,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=transform_out,
+            dst_crs=dst_crs,
+            resampling=Resampling.nearest,
+        )
+
+        rgba = np.stack([dst, dst, dst, (dst_valid * 255)], axis=-1)  # grey with alpha=255 on valid, 0 else
+        img = Image.fromarray(rgba, mode="RGBA")
+        img.save(out_png, "PNG")
+
+        # Bounds in lat/lon for overlay
+        south, west, north, east = array_bounds(height, width, transform_out)
+        bounds_latlon = [[south, west], [north, east]]
+
+    return out_png, bounds_latlon
+# ------------------------------------------------------------------
+
+
 # ---------------------------- UI ----------------------------
-# Top Hero
 st.markdown(
     """
     <div style="padding: 14px 18px; border-radius: 14px; background: linear-gradient(135deg,#0ea5e9, #6366f1); color: white;">
@@ -196,8 +279,15 @@ with st.sidebar:
     ref_z = st.number_input("Reference plane Z (m) for volumes", value=DEFAULT_REF_Z, step=1.0)
 
     st.markdown("---")
-    st.caption("💡 Tip: For Riyadh, UTM Zone 38N = EPSG:32638")
-    st.caption("This is a demo app — for large surveys, consider PDAL/GDAL gridding upstream.")
+    st.markdown("### Hillshade overlay")
+    hs_on = st.checkbox("Enable hillshade overlay", value=True)
+    hs_az = st.slider("Azimuth (°)", 0, 360, 315, 1)
+    hs_alt = st.slider("Altitude (°)", 1, 90, 45, 1)
+    hs_opacity = st.slider("Overlay opacity", 0.1, 1.0, 0.6, 0.05)
+    hs_z = st.slider("Z factor", 0.2, 5.0, 1.0, 0.1)
+
+    st.markdown("---")
+    st.caption("💡 For Riyadh, UTM Zone 38N = EPSG:32638")
 
 
 # ---------------------------- LOGIC PER MODE ----------------------------
@@ -207,12 +297,10 @@ stats = {}
 if mode == "Quick Demo (auto-generate)":
     st.subheader("Quick Demo")
     st.write("We’ll generate synthetic points near Riyadh, build a DEM, draw contours, compute volumes, and export LandXML — all in a few seconds.")
-
     run = st.button("▶️ Run Demo Now", type="primary")
     if run:
-        # Generate synthetic CSV (reuse your script's idea)
+        # Synthetic CSV
         csv_path = DATA_DIR / "sample_points.csv"
-        # Create a small synthetic sample inline (no import of Typer script)
         import csv, math, random
         random.seed(42)
         cx, cy = 46.675, 24.715
@@ -227,9 +315,7 @@ if mode == "Quick Demo (auto-generate)":
             pts.append((x, y, z))
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["x", "y", "z"])
-            w.writerows(pts)
+            w = csv.writer(f); w.writerow(["x", "y", "z"]); w.writerows(pts)
 
         with st.spinner("Gridding to DEM..."):
             dem_path, stats = _run_grid(str(csv_path), x="x", y="y", lon=None, lat=None, z_col="z",
@@ -252,7 +338,6 @@ elif mode == "Upload CSV & Run":
         y_col = st.text_input("Y/Northing column (or leave blank)", value="y")
     with colz:
         z_col = st.text_input("Elevation column", value="z")
-
     use_lonlat = st.checkbox("My CSV uses lon/lat instead of x/y", value=False)
 
     if up:
@@ -262,8 +347,8 @@ elif mode == "Upload CSV & Run":
             with st.spinner("Gridding to DEM..."):
                 dem_path, stats = _run_grid(
                     str(saved),
-                    x=None if use_lonlat else x_col or None,
-                    y=None if use_lonlat else y_col or None,
+                    x=None if use_lonlat else (x_col or None),
+                    y=None if use_lonlat else (y_col or None),
                     lon="lon" if use_lonlat else None,
                     lat="lat" if use_lonlat else None,
                     z_col=z_col,
@@ -276,8 +361,8 @@ elif mode == "Upload CSV & Run":
             with st.spinner("Exporting LandXML..."):
                 landxml_path = _run_landxml_from_csv(
                     str(saved),
-                    x=None if use_lonlat else x_col or None,
-                    y=None if use_lonlat else y_col or None,
+                    x=None if use_lonlat else (x_col or None),
+                    y=None if use_lonlat else (y_col or None),
                     lon="lon" if use_lonlat else None,
                     lat="lat" if use_lonlat else None,
                     z_col=z_col,
@@ -311,7 +396,16 @@ with tabs[0]:
         except Exception as e:
             st.warning(f"Could not read DEM bounds: {e}")
 
-    m = _build_map(contours_path, dem_bounds)
+    # Hillshade overlay PNG (computed lazily if DEM exists and toggle is on)
+    hs_png, hs_bounds = None, None
+    if hs_on and dem_path and os.path.exists(dem_path):
+        try:
+            hs_png_path = str(OUT_DIR / "hillshade.png")
+            hs_png, hs_bounds = _make_hillshade_png(dem_path, hs_az, hs_alt, hs_z, hs_png_path)
+        except Exception as e:
+            st.warning(f"Could not compute hillshade: {e}")
+
+    m = _build_map(contours_path, dem_bounds, hs_png, hs_bounds, hs_opacity)
     st_folium(m, height=560, use_container_width=True)
 
 with tabs[1]:
@@ -324,13 +418,11 @@ with tabs[1]:
         c4.metric("Std (m)", f"{stats['std']:.2f}")
         st.caption(f"Size: {stats['rows']} x {stats['cols']} • CRS: {stats['crs']}")
     elif dem_path and os.path.exists(dem_path):
-        # compute stats now
         try:
             with rasterio.open(dem_path) as src:
                 arr = src.read(1)
-                nodata = src.nodata
-                if nodata is not None:
-                    arr = np.where(arr == nodata, np.nan, arr)
+                if src.nodata is not None:
+                    arr = np.where(arr == src.nodata, np.nan, arr)
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Min (m)", f"{float(np.nanmin(arr)):.2f}")
                 c2.metric("Max (m)", f"{float(np.nanmax(arr)):.2f}")

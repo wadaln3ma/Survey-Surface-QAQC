@@ -11,3 +11,4 @@ scipy
 streamlit
 folium
 streamlit-folium
+pillow

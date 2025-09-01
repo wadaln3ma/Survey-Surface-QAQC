@@ -17,3 +17,4 @@ dependencies:
       - streamlit
       - folium
       - streamlit-folium
+      - pillow
