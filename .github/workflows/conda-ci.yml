@@ -1,0 +1,83 @@
+name: Conda CI – Mini Pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  mini-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up micromamba (Conda)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          micromamba-version: "1.5.10"
+          environment-file: environment.yml
+          cache-environment: true
+          cache-downloads: true
+          create-args: >-
+            python=3.11
+          init-shell: bash
+
+      - name: Show environment
+        shell: bash -l {0}
+        run: |
+          micromamba info
+          micromamba list
+
+      - name: Run mini pipeline
+        shell: bash -l {0}
+        run: |
+          set -euo pipefail
+
+          # 1) synthetic points
+          python scripts/generate_synthetic_points.py --out data/sample_points.csv
+
+          # 2) build DEM
+          python -m survey_surface.cli build-grid \
+            --input data/sample_points.csv \
+            --x x --y y --z z \
+            --in-crs EPSG:4326 --to-crs EPSG:32638 \
+            --cell 5.0 \
+            --out outputs/dem.tif
+
+          # 3) contours
+          python -m survey_surface.cli contours \
+            --raster outputs/dem.tif \
+            --interval 2.0 \
+            --out outputs/contours.geojson
+
+          # 4) volumes vs plane
+          python -m survey_surface.cli volumes \
+            --dem outputs/dem.tif \
+            --ref-z 600 > outputs/volumes.json
+
+          # 5) LandXML
+          python -m survey_surface.cli landxml \
+            --input data/sample_points.csv \
+            --in-crs EPSG:4326 --to-crs EPSG:32638 \
+            --out outputs/surface_landxml.xml
+
+          # 6) QA/QC report
+          python -m survey_surface.cli report \
+            --dem outputs/dem.tif \
+            --contours outputs/contours.geojson \
+            --out outputs/report.html
+
+          # sanity checks
+          test -s outputs/dem.tif
+          test -s outputs/contours.geojson
+          test -s outputs/volumes.json
+          test -s outputs/surface_landxml.xml
+          test -s outputs/report.html
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-pipeline-outputs
+          path: outputs/
+          if-no-files-found: error

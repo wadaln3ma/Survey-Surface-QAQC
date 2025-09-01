@@ -1,0 +1,19 @@
+name: ssqaqc
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - geopandas
+  - pyproj
+  - shapely
+  - rasterio
+  - scikit-image
+  - scipy
+  - pip
+  - pip:
+      - typer[all]
+      - rich
+      - streamlit
+      - folium
+      - streamlit-folium
