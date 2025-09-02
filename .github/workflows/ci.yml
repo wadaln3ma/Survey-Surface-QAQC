@@ -1,18 +1,23 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
+      # Set up micromamba + create env from environment.yml
       - name: Set up micromamba
         uses: mamba-org/setup-micromamba@v1
         with:
-          micromamba-version: latest             # <-- valid values: latest or 1.2.3-0 style
-          environment-file: environment.yml      # must exist and include "name: qaqc"
-          environment-name: qaqc                 # optional; overrides name in file
+          micromamba-version: latest            # valid: 'latest' or like '1.5.11-0'
+          environment-file: environment.yml     # must exist in repo root
+          environment-name: qaqc
           cache-environment: true
           cache-downloads: true
           create-args: >-
@@ -21,9 +26,17 @@ jobs:
       - name: Show environment
         run: micromamba run -n qaqc bash -lc "python -V && which python"
 
+      - name: Sanity imports
+        run: |
+          micromamba run -n qaqc python - <<'PY'
+          import numpy, rasterio, shapely, skimage, typer
+          print("imports OK")
+          PY
+
       - name: Install package (editable)
         run: micromamba run -n qaqc pip install -e .[app]
 
+      # ---- Mini pipeline smoke test (writes small outputs) ----
       - name: Mini pipeline smoke test
         run: |
           micromamba run -n qaqc python - <<'PY'
@@ -42,3 +55,13 @@ jobs:
 
       - name: CLI import (sanity)
         run: micromamba run -n qaqc python -c "import importlib; importlib.import_module('survey_surface.cli'); print('CLI import OK')"
+
+      - name: Upload mini outputs (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mini-pipeline-outputs
+          path: |
+            outputs/dem.tif
+            outputs/contours.geojson
+          if-no-files-found: ignore
