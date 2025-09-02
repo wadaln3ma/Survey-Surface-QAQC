@@ -15,7 +15,7 @@ jobs:
       - name: Set up micromamba (Conda)
         uses: mamba-org/setup-micromamba@v2
         with:
-          micromamba-version: "1.5.10"
+          micromamba-version: "1.5.11-0"
           environment-file: environment.yml
           cache-environment: true
           cache-downloads: true
